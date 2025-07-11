@@ -5,7 +5,6 @@ from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.errors import RateLimitExceeded
 import os
-
 import httpx
 import asyncio
 import logging
@@ -22,7 +21,6 @@ app.add_middleware(SlowAPIMiddleware)
 
 logging.basicConfig(level=logging.INFO)
 
-# === Rate-limit handler ===
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
@@ -44,7 +42,8 @@ coins = {
     "maker": "MKRUSDT", "dash": "DASHUSDT", "elrond": "EGLDUSDT"
 }
 
-coingecko_ids = {k: k if k != "usdc" else "usd-coin" for k in coins.keys()}
+coingecko_ids = {k: k for k in coins}
+coingecko_ids["usdc"] = "usd-coin"
 coingecko_ids["compound"] = "compound-governance-token"
 coingecko_ids["sushiswap"] = "sushi"
 
@@ -53,7 +52,6 @@ price_cache: Dict[str, Tuple[float, datetime]] = {}
 latest_prices: Dict[str, float] = {}
 CACHE_TTL_SECONDS = 30
 
-# === Weighted average ===
 def weighted_average(data, price_key, volume_key):
     total, volume_sum = 0.0, 0.0
     for trade in data:
@@ -63,7 +61,6 @@ def weighted_average(data, price_key, volume_key):
         volume_sum += volume
     return round(total / volume_sum, 6) if volume_sum > 0 else 0.0
 
-# === Retry logic ===
 async def fetch_with_retry(client, url, retries=3, backoff=1):
     for attempt in range(retries):
         try:
@@ -76,12 +73,18 @@ async def fetch_with_retry(client, url, retries=3, backoff=1):
                 await asyncio.sleep(backoff * 2**attempt)
     raise Exception(f"All retries failed for {url}")
 
-# === Exchange fetchers ===
 async def fetch_binance(symbol: str) -> float:
     url = f"https://api.binance.com/api/v3/trades?symbol={symbol}&limit=10"
     async with httpx.AsyncClient() as client:
         res = await fetch_with_retry(client, url)
         return weighted_average(res.json(), "price", "qty")
+
+async def fetch_coinbase(symbol: str) -> float:
+    pair = symbol.replace("USDT", "-USD")
+    url = f"https://api.exchange.coinbase.com/products/{pair}/trades"
+    async with httpx.AsyncClient() as client:
+        res = await fetch_with_retry(client, url)
+        return weighted_average(res.json()[:10], "price", "size")
 
 async def fetch_kraken(symbol: str) -> float:
     kraken_map = {
@@ -103,17 +106,6 @@ async def fetch_kraken(symbol: str) -> float:
         trades = list(res.json()["result"].values())[0][:10]
         return weighted_average(trades, 0, 1)
 
-async def fetch_coinbase(symbol: str) -> float:
-    symbol_map = {
-        k: v.replace("USDT", "-USD") for k, v in coins.items()
-    }
-    pair = symbol_map.get(symbol)
-    url = f"https://api.exchange.coinbase.com/products/{pair}/trades"
-    async with httpx.AsyncClient() as client:
-        res = await fetch_with_retry(client, url)
-        return weighted_average(res.json()[:10], "price", "size")
-
-# === Parallel price fetch with caching ===
 async def get_price(coin: str) -> float:
     now = datetime.utcnow()
     if coin in price_cache and price_cache[coin][1] > now:
@@ -134,7 +126,6 @@ async def get_price(coin: str) -> float:
     price_cache[coin] = (price, now + timedelta(seconds=CACHE_TTL_SECONDS))
     return price
 
-# === CoinGecko verification ===
 async def verify_prices_with_coingecko(prices: Dict[str, float]) -> Dict[str, bool]:
     ids_str = ",".join(coingecko_ids.values())
     url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids_str}&vs_currencies=usd"
@@ -155,7 +146,7 @@ async def verify_prices_with_coingecko(prices: Dict[str, float]) -> Dict[str, bo
             logging.warning(f"CoinGecko verification failed: {e}")
             return {coin: True for coin in prices}
 
-# === Background update task ===
+# === Background updater ===
 async def background_price_updater():
     while True:
         try:
@@ -168,12 +159,21 @@ async def background_price_updater():
                     prices[coin] = await get_price(coin)
             global latest_prices
             latest_prices = prices
-            logging.info("Prices updated")
+            logging.info("✅ Prices updated")
         except Exception as e:
-            logging.error(f"Background error: {e}")
+            logging.error(f"⛔ Background update error: {e}")
         await asyncio.sleep(10)
 
-# === REST API endpoint with pagination ===
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(background_price_updater())
+
+# === New API: flat list for CRON ===
+@app.get("/all-prices")
+async def get_all_prices():
+    return latest_prices
+
+# === Keep existing paginated API ===
 @router.get("/prices")
 @limiter.limit("10/minute")
 async def prices(request: Request, page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=50)):
@@ -195,19 +195,9 @@ async def websocket_prices(websocket: WebSocket):
         except Exception:
             break
 
-# === Start background job on startup ===
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(background_price_updater())
-
 # === Register the router ===
 app.include_router(router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",  # main is the filename without .py
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000)),
-        reload=False
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=False)
