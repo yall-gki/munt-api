@@ -17,7 +17,7 @@ app = FastAPI()
 
 # List of allowed origins (your Next.js frontend URL)
 origins = [
-    "https://your-frontend-domain.com",
+    "https://munt-xi.vercel.app/",
     "http://localhost:3000",  # for local development
 ]
 
