@@ -1,321 +1,221 @@
-from fastapi import FastAPI, WebSocket, Request, APIRouter, Query, HTTPException
+from fastapi import FastAPI, WebSocket, Request, APIRouter, Query, HTTPException, Path
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.errors import RateLimitExceeded
+
 import os
 import httpx
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple
 
-from fastapi.middleware.cors import CORSMiddleware
+# =====================
+# APP SETUP
+# =====================
 
 app = FastAPI()
+router = APIRouter()
 
-# List of allowed origins (your Next.js frontend URL)
-origins = [
-    "https://munt-xi.vercel.app/",
-    "http://localhost:3000",  # for local development
-]
+logging.basicConfig(level=logging.INFO)
+
+# =====================
+# CORS (FIXED)
+# =====================
+
+ALLOWED_ORIGINS = {
+    "https://munt-xi.vercel.app",
+    "http://localhost:3000",
+}
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,  # or ["*"] to allow all (not recommended for production)
+    allow_origins=list(ALLOWED_ORIGINS),
     allow_credentials=True,
-    allow_methods=["*"],     # GET, POST, etc.
-    allow_headers=["*"],     # headers like Content-Type, Authorization
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# === FastAPI and Middleware setup ===
-
-router = APIRouter()
+# =====================
+# RATE LIMITING
+# =====================
 
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
-logging.basicConfig(level=logging.INFO)
-
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(
         status_code=429,
-        content={"detail": "Rate limit exceeded. Please wait before retrying."}
+        content={"detail": "Rate limit exceeded. Please wait before retrying."},
     )
 
-# === Coin mappings ===
+# =====================
+# COINS
+# =====================
+
 coins = {
-    "bitcoin": "BTCUSDT", "ethereum": "ETHUSDT", "binancecoin": "BNBUSDT",
-    "cardano": "ADAUSDT", "ripple": "XRPUSDT", "polkadot": "DOTUSDT",
-    "uniswap": "UNIUSDT", "chainlink": "LINKUSDT", "litecoin": "LTCUSDT",
-    "stellar": "XLMUSDT", "usdc": "USDCUSDT", "dogecoin": "DOGEUSDT",
-    "vechain": "VETUSDT", "filecoin": "FILUSDT", "tron": "TRXUSDT",
-    "eos": "EOSUSDT", "aave": "AAVEUSDT", "monero": "XMRUSDT",
-    "cosmos": "ATOMUSDT", "tezos": "XTZUSDT", "algorand": "ALGOUSDT",
-    "nem": "XEMUSDT", "compound": "COMPUSDT", "kusama": "KSMUSDT",
-    "zilliqa": "ZILUSDT", "neo": "NEOUSDT", "sushiswap": "SUSHIUSDT",
-    "maker": "MKRUSDT", "dash": "DASHUSDT", "elrond": "EGLDUSDT"
+    "bitcoin": "BTCUSDT",
+    "ethereum": "ETHUSDT",
+    "binancecoin": "BNBUSDT",
+    "cardano": "ADAUSDT",
+    "ripple": "XRPUSDT",
 }
 
-coingecko_ids = {k: k for k in coins}
-coingecko_ids["usdc"] = "usd-coin"
-coingecko_ids["compound"] = "compound-governance-token"
-coingecko_ids["sushiswap"] = "sushi"
+coingecko_ids = {
+    "bitcoin": "bitcoin",
+    "ethereum": "ethereum",
+    "binancecoin": "binancecoin",
+    "cardano": "cardano",
+    "ripple": "ripple",
+}
 
-# === In-memory cache ===
+# =====================
+# CACHE + STORAGE
+# =====================
+
 price_cache: Dict[str, Tuple[float, datetime]] = {}
 latest_prices: Dict[str, float] = {}
+historical_prices: Dict[str, list] = {c: [] for c in coins}
+
 CACHE_TTL_SECONDS = 30
 
-def weighted_average(data, price_key, volume_key):
-    total, volume_sum = 0.0, 0.0
-    for trade in data:
-        price = float(trade[price_key])
-        volume = float(trade[volume_key])
-        total += price * volume
-        volume_sum += volume
-    return round(total / volume_sum, 6) if volume_sum > 0 else 0.0
+# =====================
+# HELPERS
+# =====================
 
-async def fetch_with_retry(client, url, retries=3, backoff=1):
-    for attempt in range(retries):
+def weighted_average(data, price_key, volume_key):
+    total, volume = 0.0, 0.0
+    for d in data:
+        p, v = float(d[price_key]), float(d[volume_key])
+        total += p * v
+        volume += v
+    return round(total / volume, 6) if volume else 0.0
+
+async def fetch_with_retry(client, url, retries=3):
+    for i in range(retries):
         try:
-            res = await client.get(url, timeout=5)
-            res.raise_for_status()
-            return res
-        except Exception as e:
-            logging.warning(f"Fetch failed ({url}): {e}")
-            if attempt < retries - 1:
-                await asyncio.sleep(backoff * 2**attempt)
-    raise Exception(f"All retries failed for {url}")
+            r = await client.get(url, timeout=5)
+            r.raise_for_status()
+            return r
+        except Exception:
+            await asyncio.sleep(2 ** i)
+    raise RuntimeError("Fetch failed")
 
 async def fetch_binance(symbol: str) -> float:
     url = f"https://api.binance.com/api/v3/trades?symbol={symbol}&limit=10"
-    async with httpx.AsyncClient() as client:
-        res = await fetch_with_retry(client, url)
-        return weighted_average(res.json(), "price", "qty")
-
-async def fetch_coinbase(symbol: str) -> float:
-    pair = symbol.replace("USDT", "-USD")
-    url = f"https://api.exchange.coinbase.com/products/{pair}/trades"
-    async with httpx.AsyncClient() as client:
-        res = await fetch_with_retry(client, url)
-        return weighted_average(res.json()[:10], "price", "size")
-
-async def fetch_kraken(symbol: str) -> float:
-    kraken_map = {
-        "BTCUSDT": "XBTUSD", "ETHUSDT": "ETHUSD", "BNBUSDT": "BNBUSD",
-        "ADAUSDT": "ADAUSD", "XRPUSDT": "XRPUSD", "DOTUSDT": "DOTUSD",
-        "UNIUSDT": "UNIUSD", "LINKUSDT": "LINKUSD", "LTCUSDT": "LTCUSD",
-        "XLMUSDT": "XLMUSD", "DOGEUSDT": "DOGEUSD", "VETUSDT": "VETUSD",
-        "FILUSDT": "FILUSD", "TRXUSDT": "TRXUSD", "EOSUSDT": "EOSUSD",
-        "AAVEUSDT": "AAVEUSD", "XMRUSDT": "XMRUSD", "ATOMUSDT": "ATOMUSD",
-        "XTZUSDT": "XTZUSD", "ALGOUSDT": "ALGOUSD", "XEMUSDT": "XEMUSD",
-        "COMPUSDT": "COMPUSD", "KSMUSDT": "KSMUSD", "ZILUSDT": "ZILUSD",
-        "NEOUSDT": "NEOUSD", "SUSHIUSDT": "SUSHIUSD", "MKRUSDT": "MKRUSD",
-        "DASHUSDT": "DASHUSD", "EGLDUSDT": "EGLDUSD"
-    }
-    pair = kraken_map.get(symbol)
-    url = f"https://api.kraken.com/0/public/Trades?pair={pair}"
-    async with httpx.AsyncClient() as client:
-        res = await fetch_with_retry(client, url)
-        trades = list(res.json()["result"].values())[0][:10]
-        return weighted_average(trades, 0, 1)
+    async with httpx.AsyncClient() as c:
+        r = await fetch_with_retry(c, url)
+        return weighted_average(r.json(), "price", "qty")
 
 async def get_price(coin: str) -> float:
     now = datetime.utcnow()
     if coin in price_cache and price_cache[coin][1] > now:
         return price_cache[coin][0]
 
-    symbol = coins[coin]
-    fetchers = [fetch_binance, fetch_coinbase, fetch_kraken]
-
-    async def try_fetch(fetcher):
-        try:
-            return await fetcher(symbol)
-        except Exception as e:
-            logging.warning(f"{fetcher.__name__} failed for {coin}: {e}")
-            return None
-
-    prices = await asyncio.gather(*(try_fetch(f) for f in fetchers))
-    price = next((p for p in prices if p is not None and p > 0), 0.0)
+    price = await fetch_binance(coins[coin])
     price_cache[coin] = (price, now + timedelta(seconds=CACHE_TTL_SECONDS))
     return price
 
-async def verify_prices_with_coingecko(prices: Dict[str, float]) -> Dict[str, bool]:
-    ids_str = ",".join(coingecko_ids.values())
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids_str}&vs_currencies=usd"
-    async with httpx.AsyncClient() as client:
-        try:
-            res = await client.get(url, timeout=10)
-            cg_data = res.json()
-            result = {}
-            for coin, price in prices.items():
-                cg_price = cg_data.get(coingecko_ids[coin], {}).get("usd")
-                if not cg_price:
-                    result[coin] = True
-                    continue
-                diff = abs(price - cg_price) / cg_price
-                result[coin] = diff <= 0.05
-            return result
-        except Exception as e:
-            logging.warning(f"CoinGecko verification failed: {e}")
-            return {coin: True for coin in prices}
+# =====================
+# BACKGROUND UPDATER (SINGLE, FIXED)
+# =====================
 
-# === Background updater ===
 async def background_price_updater():
     while True:
         try:
-            tasks = [get_price(coin) for coin in coins]
-            prices_list = await asyncio.gather(*tasks)
-            prices = dict(zip(coins.keys(), prices_list))
-            verified = await verify_prices_with_coingecko(prices)
-            for coin, is_valid in verified.items():
-                if not is_valid:
-                    prices[coin] = await get_price(coin)
+            prices = {}
+            now_ts = int(datetime.utcnow().replace(tzinfo=timezone.utc).timestamp())
+
+            for coin in coins:
+                price = await get_price(coin)
+                prices[coin] = price
+                historical_prices[coin].append((now_ts, price))
+                historical_prices[coin] = historical_prices[coin][-10_000:]
+
             global latest_prices
             latest_prices = prices
+
             logging.info("✅ Prices updated")
+
         except Exception as e:
-            logging.error(f"⛔ Background update error: {e}")
+            logging.error(f"⛔ Update error: {e}")
+
         await asyncio.sleep(10)
 
 @app.on_event("startup")
-async def startup_event():
+async def startup():
     asyncio.create_task(background_price_updater())
 
-# === New API: flat list for CRON ===
+# =====================
+# REST API
+# =====================
+
 @app.get("/all-prices")
-async def get_all_prices():
+async def all_prices():
     return latest_prices
 
-# === Keep existing paginated API ===
 @router.get("/prices")
 @limiter.limit("10/minute")
-async def prices(request: Request, page: int = Query(1, ge=1), page_size: int = Query(10, ge=1, le=50)):
-    start = (page - 1) * page_size
-    end = start + page_size
+async def prices(
+    request: Request,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=50),
+):
     keys = list(coins.keys())
+    start, end = (page - 1) * page_size, page * page_size
     if start >= len(keys):
-        raise HTTPException(status_code=404, detail="Page out of range")
+        raise HTTPException(404, "Page out of range")
     return {k: latest_prices.get(k, 0.0) for k in keys[start:end]}
 
-# === WebSocket for real-time price updates ===
-@app.websocket("/ws/prices")
-async def websocket_prices(websocket: WebSocket):
-    await websocket.accept()
-    while True:
-        try:
-            await websocket.send_json(latest_prices)
-            await asyncio.sleep(5)
-        except Exception:
-            break
+# =====================
+# HISTORICAL
+# =====================
 
-
-from fastapi import Path, Query
-from datetime import timezone
-
-# === New in-memory store for historical data ===
-historical_prices: Dict[str, list] = {}  # coin -> list of (timestamp, price)
-OHLC_INTERVAL_SECONDS = 60  # 1-minute candles
-
-# Initialize lists for each coin
-for coin in coins:
-    historical_prices[coin] = []
-
-# === Update historical data in background ===
-async def background_price_updater():
-    while True:
-        try:
-            tasks = [get_price(coin) for coin in coins]
-            prices_list = await asyncio.gather(*tasks)
-            prices = dict(zip(coins.keys(), prices_list))
-
-            # Store to historical data
-            now_ts = int(datetime.utcnow().replace(tzinfo=timezone.utc).timestamp())
-            for coin, price in prices.items():
-                historical_prices[coin].append((now_ts, price))
-
-                # Optional: keep only last 10,000 entries to limit memory
-                if len(historical_prices[coin]) > 10000:
-                    historical_prices[coin] = historical_prices[coin][-10000:]
-
-            verified = await verify_prices_with_coingecko(prices)
-            for coin, is_valid in verified.items():
-                if not is_valid:
-                    prices[coin] = await get_price(coin)
-
-            global latest_prices
-            latest_prices = prices
-            logging.info("✅ Prices updated")
-        except Exception as e:
-            logging.error(f"⛔ Background update error: {e}")
-        await asyncio.sleep(10)
-
-# === Endpoint: historical market_chart ===
 @router.get("/coins/{coin}/market_chart")
-async def market_chart(
-    coin: str = Path(..., description="Coin name, e.g., bitcoin"),
-    days: int = Query(10, ge=1, le=365)
-):
+async def market_chart(coin: str, days: int = Query(10, ge=1)):
     if coin not in historical_prices:
-        raise HTTPException(status_code=404, detail="Coin not found")
+        raise HTTPException(404, "Coin not found")
 
-    now_ts = int(datetime.utcnow().timestamp())
-    cutoff_ts = now_ts - days * 24 * 60 * 60
+    cutoff = int(datetime.utcnow().timestamp()) - days * 86400
+    return {
+        "prices": [[ts * 1000, p] for ts, p in historical_prices[coin] if ts >= cutoff]
+    }
 
-    data = [ [ts * 1000, price] for ts, price in historical_prices[coin] if ts >= cutoff_ts ]
-    return {"prices": data}
+# =====================
+# WEBSOCKET (SECURED)
+# =====================
 
-# === Endpoint: OHLC candles ===
-@router.get("/coins/{coin}/ohlc")
-async def ohlc(
-    coin: str = Path(..., description="Coin name, e.g., bitcoin"),
-    days: int = Query(10, ge=1, le=365),
-    interval: int = Query(60, description="Candle interval in seconds, default 60s")
-):
-    if coin not in historical_prices:
-        raise HTTPException(status_code=404, detail="Coin not found")
+@app.websocket("/ws/prices")
+async def ws_prices(ws: WebSocket):
+    origin = ws.headers.get("origin")
+    if origin not in ALLOWED_ORIGINS:
+        await ws.close(code=1008)
+        return
 
-    now_ts = int(datetime.utcnow().timestamp())
-    cutoff_ts = now_ts - days * 24 * 60 * 60
-    prices_list = [ (ts, price) for ts, price in historical_prices[coin] if ts >= cutoff_ts ]
+    await ws.accept()
 
-    # Aggregate OHLC per interval
-    candles = []
-    if prices_list:
-        prices_list.sort()
-        current_open = prices_list[0][1]
-        current_high = prices_list[0][1]
-        current_low = prices_list[0][1]
-        current_close = prices_list[0][1]
-        current_ts = prices_list[0][0] - (prices_list[0][0] % interval)
+    try:
+        while True:
+            await ws.send_json(latest_prices)
+            await asyncio.sleep(5)
+    except Exception:
+        pass
 
-        for ts, price in prices_list:
-            bucket = ts - (ts % interval)
-            if bucket != current_ts:
-                # Save previous candle
-                candles.append([current_ts * 1000, current_open, current_high, current_low, current_close])
-                # Start new candle
-                current_ts = bucket
-                current_open = price
-                current_high = price
-                current_low = price
-                current_close = price
-            else:
-                current_high = max(current_high, price)
-                current_low = min(current_low, price)
-                current_close = price
-        # Append last candle
-        candles.append([current_ts * 1000, current_open, current_high, current_low, current_close])
+# =====================
+# REGISTER ROUTER
+# =====================
 
-    return {"ohlc": candles}
-
-# === Register the router ===
 app.include_router(router)
+
+# =====================
+# ENTRYPOINT
+# =====================
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
