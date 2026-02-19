@@ -5,6 +5,7 @@ import json
 
 REST_URL = "http://localhost:8000/prices?page=1&page_size=10"
 WS_URL = "ws://localhost:8000/ws/prices"
+WS_ORIGIN = "http://localhost:3000"
 
 async def test_rest():
     async with httpx.AsyncClient() as client:
@@ -13,7 +14,7 @@ async def test_rest():
         print(response.json())
 
 async def test_ws():
-    async with websockets.connect(WS_URL) as websocket:
+    async with websockets.connect(WS_URL, origin=WS_ORIGIN) as websocket:
         print("WebSocket connected, waiting for messages...")
         for _ in range(3):  # receive 3 messages then stop
             msg = await websocket.recv()
